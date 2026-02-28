@@ -1,0 +1,232 @@
+import "module:std" as std
+import "module:spotube_plugin" as spotube
+import { SubsonicClient } from "./segments/subsonic.ht"
+import { AudioSourceEndpoint } from "./segments/audio_source.ht"
+import { CorePlugin } from "./segments/core.ht"
+
+var StreamController = std.StreamController
+var Stream = std.Stream
+var LocalStorage = spotube.LocalStorage
+var SpotubeForm = spotube.SpotubeForm
+var JSON = std.JSON
+
+/// Navidrome Spotube Plugin
+///
+/// Uses a self-hosted Navidrome server (via the Subsonic API) as both:
+///   - the track finder / search provider  (search3.view)
+///   - the audio source / stream provider  (stream.view)
+///
+/// No external music services are consulted; all searches and streams
+/// come exclusively from the configured Navidrome instance.
+class NavidromePlugin {
+  var _baseUrl: string
+  var _username: string
+  var _password: string
+
+  var _authController: StreamController
+  var audioSource: AudioSourceEndpoint
+  var core: CorePlugin
+
+  get authStateStream -> Stream => _authController.stream
+
+  construct () {
+    _baseUrl = ""
+    _username = ""
+    _password = ""
+    _authController = StreamController.broadcast()
+    core = CorePlugin()
+    audioSource = AudioSourceEndpoint(null)
+
+    _loadSettings()
+  }
+
+  // ─── Internal helpers ────────────────────────────────────────────────────────
+
+  fun _loadSettings() {
+    LocalStorage.getString("navidrome_config").then((raw) {
+      if (raw == null || raw.isEmpty) {
+        return
+      }
+
+      var config = JSON.decode(raw)
+      _baseUrl = config["baseUrl"] ?? ""
+      _username = config["username"] ?? ""
+      _password = config["password"] ?? ""
+
+      if (_baseUrl.isNotEmpty && _username.isNotEmpty && _password.isNotEmpty) {
+        audioSource = AudioSourceEndpoint(
+          SubsonicClient(_baseUrl, _username, _password)
+        )
+        _authController.add({ "type": "recovered" }.toJson())
+      }
+    })
+  }
+
+  fun _saveSettings(baseUrl: string, username: string, password: string) -> Future {
+    _baseUrl = baseUrl
+    _username = username
+    _password = password
+    audioSource = AudioSourceEndpoint(
+      SubsonicClient(baseUrl, username, password)
+    )
+
+    return LocalStorage.setString(
+      "navidrome_config",
+      JSON.encode({
+        "baseUrl": baseUrl,
+        "username": username,
+        "password": password
+      }.toJson())
+    )
+  }
+
+  fun _stripTrailingSlash(url: string) -> string {
+    if (url.endsWith("/")) {
+      return url.substring(0, url.length - 1)
+    }
+    return url
+  }
+
+  // ─── Authentication ability ───────────────────────────────────────────────────
+
+  /// Returns true when a Navidrome server has been configured and credentials
+  /// have been saved to local storage.
+  fun isAuthenticated() -> bool {
+    return _baseUrl.isNotEmpty && _username.isNotEmpty && _password.isNotEmpty
+  }
+
+  /// Shows a settings form that collects the Navidrome server URL, username,
+  /// and password.  After the form is submitted, the plugin pings the server
+  /// to verify the connection before persisting the credentials.
+  fun authenticate() -> Future {
+    return SpotubeForm.show(
+      "Navidrome Settings",
+      [
+        {
+          objectType: "text",
+          text: "## Connect to Navidrome",
+        }.toJson(),
+        {
+          objectType: "text",
+          text: "Enter the base URL of your Navidrome server (include http:// or https://).",
+        }.toJson(),
+        {
+          objectType: "input",
+          id: "baseUrl",
+          variant: "text",
+          placeholder: "http://192.168.1.100:4533",
+          required: true,
+          value: _baseUrl,
+        }.toJson(),
+        {
+          objectType: "text",
+          text: "Username",
+        }.toJson(),
+        {
+          objectType: "input",
+          id: "username",
+          variant: "text",
+          placeholder: "admin",
+          required: true,
+          value: _username,
+        }.toJson(),
+        {
+          objectType: "text",
+          text: "Password",
+        }.toJson(),
+        {
+          objectType: "input",
+          id: "password",
+          variant: "password",
+          placeholder: "your-password",
+          required: true,
+        }.toJson(),
+        {
+          objectType: "text",
+          text: "⚠️ **Security note:** Use HTTPS when accessing Navidrome over the internet to protect your credentials.",
+        }.toJson(),
+      ]
+    ).then((values) {
+      if (values == null) {
+        return
+      }
+
+      var baseUrl = ""
+      var username = ""
+      var password = ""
+
+      for (var value in values) {
+        if (value["id"] == "baseUrl") {
+          baseUrl = value["value"] ?? ""
+        } else if (value["id"] == "username") {
+          username = value["value"] ?? ""
+        } else if (value["id"] == "password") {
+          password = value["value"] ?? ""
+        }
+      }
+
+      if (baseUrl.isEmpty || username.isEmpty || password.isEmpty) {
+        throw "All fields (URL, username, password) are required."
+      }
+
+      baseUrl = _stripTrailingSlash(baseUrl)
+
+      // Test the connection before saving.
+      var client = SubsonicClient(baseUrl, username, password)
+      return client.ping().then((res) {
+        var subsonicResponse = res.data["subsonic-response"]
+        if (subsonicResponse == null || subsonicResponse["status"] != "ok") {
+          var errorMsg = subsonicResponse?["error"]?["message"] ?? "Unexpected server response"
+          throw "Connection test failed: ${errorMsg}"
+        }
+
+        return _saveSettings(baseUrl, username, password).then(() {
+          _authController.add({ "type": "login" }.toJson())
+        })
+      })
+    })
+  }
+
+  /// Clears saved credentials and disconnects from Navidrome.
+  fun logout() -> Future {
+    return LocalStorage.remove("navidrome_config").then(() {
+      _baseUrl = ""
+      _username = ""
+      _password = ""
+      audioSource = AudioSourceEndpoint(null)
+      _authController.add({ "type": "logout" }.toJson())
+    })
+  }
+
+  // ─── AudioSource ability ──────────────────────────────────────────────────────
+
+  /// List of quality presets the plugin can deliver.
+  get supportedPresets -> List => audioSource.supportedPresets
+
+  /// Search Navidrome for audio tracks matching [track].
+  /// Only Navidrome results are returned – no fallback to external sources.
+  fun matches(track: Map) -> List {
+    if (!isAuthenticated()) {
+      throw "Navidrome is not configured. Open the plugin settings to connect."
+    }
+    return audioSource.matches(track)
+  }
+
+  /// Return stream URLs for the given Navidrome match object.
+  fun streams(match: Map) -> List {
+    if (!isAuthenticated()) {
+      throw "Navidrome is not configured. Open the plugin settings to connect."
+    }
+    return audioSource.streams(match)
+  }
+
+  // ─── Core methods ─────────────────────────────────────────────────────────────
+
+  fun checkUpdate(currentConfig: Map) -> Future {
+    return core.checkUpdate(currentConfig)
+  }
+
+  get support -> string => core.support
+}
+
+export { NavidromePlugin }

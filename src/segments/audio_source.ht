@@ -1,0 +1,135 @@
+import { SubsonicClient } from "./subsonic.ht"
+
+/// Converts raw Subsonic song objects into the SpotubeAudioSourceMatchObject
+/// format expected by the Spotube plugin framework.
+class Converter {
+  static fun toSpotubeMatchObject(songs: List, client: SubsonicClient) -> List {
+    return songs.map((song) {
+      var coverArtId = song["coverArt"]
+      var thumbnail = (coverArtId != null && coverArtId.toString().isNotEmpty)
+        ? client.coverArtUrl(coverArtId.toString())
+        : ""
+
+      // Store the file suffix so streams() can report the correct container type.
+      var suffix = song["suffix"] ?? "mp3"
+
+      return {
+        "id": song["id"].toString(),
+        "title": song["title"] ?? "",
+        "artists": [song["artist"] ?? "Unknown Artist"],
+        "duration": (song["duration"] ?? 0) * 1000,
+        "thumbnail": thumbnail,
+        "externalUri": "${client.baseUrl}/app/#/album/${song["albumId"] ?? ""}",
+        "_suffix": suffix.toString(),
+      }.toJson()
+    }).toList()
+  }
+}
+
+class AudioSourceEndpoint {
+  var client: SubsonicClient
+
+  construct (this.client)
+
+  /// Supported quality presets presented to the user in Spotube settings.
+  /// Navidrome serves the original file when no format is requested, and can
+  /// transcode to MP3 on demand (requires a transcoder like ffmpeg configured
+  /// in Navidrome).
+  get supportedPresets -> List {
+    return [
+      {
+        type: "lossless",
+        name: "flac",
+        qualities: [
+          { bitDepth: 16, sampleRate: 44100 }
+        ]
+      }.toJson(),
+      {
+        type: "lossy",
+        name: "mp3",
+        qualities: [
+          { bitrate: 320000 },
+          { bitrate: 128000 }
+        ]
+      }.toJson(),
+    ]
+  }
+
+  /// Search Navidrome for audio tracks matching the given Spotube track.
+  ///
+  /// The search is performed ONLY against the configured Navidrome server;
+  /// no external sources are consulted.
+  ///
+  /// @param track - Map<SpotubeTrackObject> containing at minimum:
+  ///   - name: string
+  ///   - artists: List<{ name: string }>
+  ///   - isrc: string? (optional ISRC code – not used by Subsonic, ignored)
+  /// @returns Future<List<SpotubeAudioSourceMatchObject>>
+  fun matches(track: Map) -> List {
+    var query = "${track["name"]} ${track["artists"][0]["name"]}"
+
+    return client.search(query, 5).then((res) {
+      var subsonicResponse = res.data["subsonic-response"]
+      if (subsonicResponse == null || subsonicResponse["status"] != "ok") {
+        return []
+      }
+
+      var searchResult = subsonicResponse["searchResult3"]
+      if (searchResult == null) {
+        return []
+      }
+
+      var songs = searchResult["song"]
+      if (songs == null || songs.isEmpty) {
+        return []
+      }
+
+      return Converter.toSpotubeMatchObject(songs, client)
+    })
+  }
+
+  /// Return available audio streams for the given match.
+  ///
+  /// Returns two streams:
+  ///   1. The original file (no transcoding) – uses the format from the search result.
+  ///   2. An MP3 320 kbps transcoded stream – requires ffmpeg in Navidrome.
+  ///
+  /// @param match - Map<SpotubeAudioSourceMatchObject> with an "id" field
+  ///   containing the Subsonic song ID (as returned by matches()).
+  /// @returns List<SpotubeAudioSourceStreamObject>
+  fun streams(match: Map) -> List {
+    final songId = match["id"].toString()
+    // Use the file suffix stored by matches() to report the correct container.
+    // Falls back to "mp3" if not available (e.g., when called with a non-Navidrome match).
+    final container = (match["_suffix"] ?? "mp3").toString()
+    final isLossless = container == "flac" || container == "alac" ||
+                       container == "wav" || container == "aiff"
+
+    var originalStream = isLossless
+      ? {
+          "url": client.streamUrl(songId),
+          "container": container,
+          "type": "lossless",
+          "bitDepth": 16,
+          "sampleRate": 44100,
+        }.toJson()
+      : {
+          "url": client.streamUrl(songId),
+          "container": container,
+          "type": "lossy",
+          "bitrate": 320000,
+        }.toJson()
+
+    return [
+      originalStream,
+      {
+        "url": client.streamUrlTranscoded(songId, "mp3", 320),
+        "container": "mp3",
+        "type": "lossy",
+        "bitrate": 320000,
+      }.toJson(),
+    ]
+  }
+}
+
+export { AudioSourceEndpoint }
