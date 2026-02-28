@@ -1,0 +1,97 @@
+import "module:std" as std
+
+var HttpClient = std.HttpClient
+var RequestOptions = std.RequestOptions
+
+class CorePlugin {
+  /// Checks whether a newer version of the plugin is available on GitHub.
+  ///
+  /// Returns a map with `downloadUrl`, `version`, and `changelog` if an
+  /// update is available, or null if the current version is the latest.
+  fun checkUpdate(currentConfig: Map) -> Future {
+    var versionParts = currentConfig["version"].split(".")
+    var major = int.parse(versionParts[0])
+    var minor = int.parse(versionParts[1])
+    var patch = int.parse(versionParts[2])
+
+    var ghClient = HttpClient()
+
+    return ghClient.get_req(
+      "https://api.github.com/repos/Samuel095383/navi-spotube-plugin/releases/latest",
+      options: RequestOptions(
+        headers: {
+          "Accept": "application/vnd.github.v3+json"
+        }.toJson()
+      ),
+    ).then((res) {
+      var data = res.data
+      var tagName = data["tag_name"]
+
+      if (tagName == null || tagName.isEmpty) {
+        return null
+      }
+
+      // Strip a leading 'v' prefix common in GitHub release tags (e.g. "v1.2.3").
+      var versionStr = tagName
+      if (versionStr.startsWith("v")) {
+        versionStr = versionStr.substring(1)
+      }
+
+      var latestVersion = versionStr.split(".")
+      if (latestVersion.length < 3) {
+        return null
+      }
+
+      var latestMajor = int.parse(latestVersion[0])
+      var latestMinor = int.parse(latestVersion[1])
+      var latestPatch = int.parse(latestVersion[2])
+
+      var isUpdateAvailable = latestMajor > major ||
+        (latestMajor == major && latestMinor > minor) ||
+        (latestMajor == major && latestMinor == minor && latestPatch > patch)
+
+      if (!isUpdateAvailable) return null
+
+      var downloadUrl = data["assets"].firstWhere(
+        (asset) => asset["name"] == "plugin.smplug",
+        orElse: () => null
+      )?["browser_download_url"]
+
+      if (downloadUrl == null) {
+        throw "No plugin.smplug asset found in the latest GitHub release"
+      }
+
+      return {
+        "downloadUrl": downloadUrl,
+        "version": tagName,
+        "changelog": data["body"] ?? "No changelog available"
+      }.toJson()
+    })
+  }
+
+  /// Returns support information in Markdown format.
+  get support -> string {
+    return """
+# Navidrome Plugin Support
+
+This plugin connects Spotube to your self-hosted [Navidrome](https://www.navidrome.org/) music server using the Subsonic API.
+
+## Help & Issues
+
+Please open an issue on the plugin repository:
+[github.com/Samuel095383/navi-spotube-plugin](https://github.com/Samuel095383/navi-spotube-plugin/issues)
+
+## Navidrome Documentation
+
+- [Navidrome Setup Guide](https://www.navidrome.org/docs/installation/)
+- [Subsonic API Reference](http://www.subsonic.org/pages/api.jsp)
+
+## Transcoding
+
+For MP3 streams to work, Navidrome must have **ffmpeg** installed and transcoding enabled in its configuration.
+Original-quality streams do not require transcoding.
+"""
+  }
+}
+
+export { CorePlugin }

@@ -1,0 +1,11 @@
+{
+  "version": "1.0.0",
+  "name": "Navidrome",
+  "author": "Samuel095383",
+  "description": "Navidrome (Subsonic API) audio source plugin for Spotube – searches and streams exclusively from your self-hosted Navidrome server.",
+  "entryPoint": "NavidromePlugin",
+  "apis": ["localstorage"],
+  "abilities": ["audio-source", "authentication"],
+  "repository": "https://github.com/Samuel095383/navi-spotube-plugin",
+  "pluginApiVersion": "2.0.0"
+}
